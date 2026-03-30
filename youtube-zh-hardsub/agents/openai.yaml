@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTube 中字硬字幕"
+  short_description: "下载 YouTube 视频、翻译中文字幕并烧录硬字幕"
+  default_prompt: "输入 YouTube 视频地址，输出带有中文字幕的硬字幕视频文件。"
