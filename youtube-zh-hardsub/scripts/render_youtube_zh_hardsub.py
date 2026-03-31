@@ -7,6 +7,7 @@ and burn the translated subtitles into a hard-subbed MP4.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -28,6 +30,12 @@ DEFAULT_FONT = os.environ.get("YOUTUBE_ZH_HARDSUB_FONT", "Noto Sans CJK SC")
 DEFAULT_OUTPUT_DIR = str(Path.home() / "Videos")
 DEFAULT_PROXY = "http://127.0.0.1:7890"
 DEFAULT_COOKIES_BROWSER = "firefox"
+TIMING_PATTERN = re.compile(
+    r"(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})"
+)
+VTT_TIMING_PATTERN = re.compile(
+    r"(?P<start>(?:\d{2}:)?\d{2}:\d{2}\.\d{3})\s*-->\s*(?P<end>(?:\d{2}:)?\d{2}:\d{2}\.\d{3})"
+)
 SYSTEM_PROMPT = """You translate English subtitle text into Simplified Chinese.
 Return valid JSON only, in the exact shape:
 {"items":[{"id":1,"translated":"..."},{"id":2,"translated":"..."}]}
@@ -96,6 +104,22 @@ class SubtitleEntry:
     index: int
     timing: str
     text: str
+
+
+@dataclass
+class SubtitleCandidateResult:
+    format_name: str
+    path: Path
+    issue_count: int
+    overlap_count: int
+
+
+@dataclass(frozen=True)
+class EncoderPlan:
+    family: str
+    codec: str
+    encoder: str
+    label: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -183,12 +207,23 @@ def parse_args() -> argparse.Namespace:
         "--crf",
         type=int,
         default=21,
-        help="ffmpeg CRF value for the output video",
+        help="Fallback quality target when source bitrate probing is unavailable",
     )
     parser.add_argument(
         "--preset",
         default="medium",
-        help="ffmpeg x264 preset for the output video",
+        help="ffmpeg x264 preset for CPU mode",
+    )
+    parser.add_argument(
+        "--video-encoder",
+        choices=["auto", "nvidia", "cpu"],
+        default="auto",
+        help="Burn-step video encoder: auto prefers NVIDIA NVENC when available",
+    )
+    parser.add_argument(
+        "--use-nvidia",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
@@ -200,6 +235,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--chunk-size must be greater than 0")
     if args.chunk_chars <= 0:
         parser.error("--chunk-chars must be greater than 0")
+    if args.use_nvidia:
+        args.video_encoder = "nvidia"
     return args
 
 
@@ -239,6 +276,64 @@ def normalize_optional_arg(value: str | None) -> str | None:
     if not stripped or stripped.lower() in {"none", "false", "no"}:
         return None
     return stripped
+
+
+def parse_srt_timestamp(value: str) -> int:
+    hours, minutes, seconds_and_ms = value.split(":")
+    seconds, milliseconds = seconds_and_ms.split(",")
+    return (
+        int(hours) * 3_600_000
+        + int(minutes) * 60_000
+        + int(seconds) * 1_000
+        + int(milliseconds)
+    )
+
+
+def format_srt_timestamp(value: int) -> str:
+    value = max(value, 0)
+    hours, remainder = divmod(value, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1_000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+
+def parse_timing_range(timing: str) -> tuple[int, int]:
+    match = TIMING_PATTERN.fullmatch(timing.strip())
+    if not match:
+        raise RuntimeError(f"Invalid SRT timing line: {timing!r}")
+    return (
+        parse_srt_timestamp(match.group("start")),
+        parse_srt_timestamp(match.group("end")),
+    )
+
+
+def format_timing_range(start_ms: int, end_ms: int) -> str:
+    return f"{format_srt_timestamp(start_ms)} --> {format_srt_timestamp(end_ms)}"
+
+
+def parse_vtt_timestamp(value: str) -> int:
+    parts = value.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds_and_ms = parts
+    elif len(parts) == 3:
+        hours, minutes, seconds_and_ms = parts
+    else:
+        raise RuntimeError(f"Invalid VTT timestamp: {value!r}")
+    seconds, milliseconds = seconds_and_ms.split(".")
+    return (
+        int(hours) * 3_600_000
+        + int(minutes) * 60_000
+        + int(seconds) * 1_000
+        + int(milliseconds)
+    )
+
+
+def backup_file_once(path: Path) -> Path:
+    backup_path = path.with_name(f"{path.name}.bak")
+    if not backup_path.exists():
+        shutil.copy2(path, backup_path)
+    return backup_path
 
 
 def prepare_work_dir(output_dir: Path, metadata: dict, explicit_dir: Path | None) -> Path:
@@ -325,13 +420,12 @@ def load_saved_metadata(work_dir: Path) -> dict:
     return json.loads(metadata_path.read_text(encoding="utf-8"))
 
 
-def download_assets(
+def download_video(
     url: str,
     work_dir: Path,
-    track: SubtitleTrack,
     proxy: str | None,
     cookies_from_browser: str | None,
-) -> tuple[Path, Path]:
+) -> Path:
     cmd = [
         "yt-dlp",
         "--no-playlist",
@@ -339,6 +433,80 @@ def download_assets(
         "mp4",
         "--output",
         "source.%(ext)s",
+    ]
+    add_yt_dlp_network_args(cmd, proxy, cookies_from_browser)
+    cmd.append(url)
+    run(cmd, cwd=work_dir)
+    return find_video_path(work_dir)
+
+
+def cleanup_subtitle_candidates(work_dir: Path, prefix: str) -> None:
+    for path in work_dir.iterdir():
+        if not path.is_file():
+            continue
+        if path.name == prefix or path.name.startswith(f"{prefix}."):
+            path.unlink(missing_ok=True)
+
+
+def find_candidate_file_path(
+    work_dir: Path,
+    prefix: str,
+    suffixes: set[str],
+    preferred_language: str | None = None,
+) -> Path:
+    candidates = sorted(
+        path
+        for path in work_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in suffixes
+        and (path.name == prefix or path.name.startswith(f"{prefix}."))
+    )
+    if not candidates:
+        suffix_label = ", ".join(sorted(suffixes))
+        raise RuntimeError(f"Candidate file not found for prefix {prefix!r} with suffixes {suffix_label}")
+
+    def score(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        preferred = (preferred_language or "").lower()
+        if preferred and name == f"{prefix}.{preferred}.srt":
+            return (0, name)
+        if preferred and name.startswith(f"{prefix}.{preferred}."):
+            return (1, name)
+        if name == f"{prefix}.en.srt":
+            return (2, name)
+        if ".en." in name or name.startswith(f"{prefix}.en"):
+            return (3, name)
+        return (99, name)
+
+    best = min(candidates, key=score)
+    if score(best)[0] >= 99:
+        raise RuntimeError(f"Could not determine subtitle candidate for prefix {prefix!r}")
+    return best
+
+
+def inspect_subtitle_candidate(path: Path) -> tuple[int, int]:
+    entries = parse_srt(path)
+    _, overlap_count, changed_count = normalize_subtitle_timings(entries)
+    return overlap_count, changed_count
+
+
+def download_subtitle_candidate(
+    url: str,
+    work_dir: Path,
+    track: SubtitleTrack,
+    proxy: str | None,
+    cookies_from_browser: str | None,
+    prefix: str,
+    sub_format: str,
+) -> SubtitleCandidateResult:
+    cleanup_subtitle_candidates(work_dir, prefix)
+
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--no-playlist",
+        "--output",
+        f"{prefix}.%(ext)s",
     ]
     add_yt_dlp_network_args(cmd, proxy, cookies_from_browser)
     if track.source == "manual":
@@ -350,14 +518,190 @@ def download_assets(
             "--sub-langs",
             track.language,
             "--sub-format",
-            "srt/best",
+            sub_format,
             "--convert-subs",
             "srt",
             url,
         ]
     )
     run(cmd, cwd=work_dir)
-    return find_video_path(work_dir), find_english_subtitle_path(work_dir, track.language)
+    subtitle_path = find_candidate_file_path(work_dir, prefix, {".srt"}, track.language)
+    overlap_count, issue_count = inspect_subtitle_candidate(subtitle_path)
+    print(
+        f"[subtitle] {sub_format} produced {subtitle_path.name} "
+        f"with {issue_count} timing issues ({overlap_count} overlaps)",
+        file=sys.stderr,
+    )
+    return SubtitleCandidateResult(
+        format_name=sub_format,
+        path=subtitle_path,
+        issue_count=issue_count,
+        overlap_count=overlap_count,
+    )
+
+
+def download_raw_subtitle_candidate(
+    url: str,
+    work_dir: Path,
+    track: SubtitleTrack,
+    proxy: str | None,
+    cookies_from_browser: str | None,
+    prefix: str,
+    sub_format: str,
+    suffix: str,
+) -> Path:
+    cleanup_subtitle_candidates(work_dir, prefix)
+
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--no-playlist",
+        "--output",
+        f"{prefix}.%(ext)s",
+    ]
+    add_yt_dlp_network_args(cmd, proxy, cookies_from_browser)
+    if track.source == "manual":
+        cmd.append("--write-sub")
+    else:
+        cmd.append("--write-auto-sub")
+    cmd.extend(
+        [
+            "--sub-langs",
+            track.language,
+            "--sub-format",
+            sub_format,
+            url,
+        ]
+    )
+    run(cmd, cwd=work_dir)
+    return find_candidate_file_path(work_dir, prefix, {suffix}, track.language)
+
+
+def download_structured_subtitle_candidate(
+    url: str,
+    work_dir: Path,
+    track: SubtitleTrack,
+    proxy: str | None,
+    cookies_from_browser: str | None,
+    prefix: str,
+    sub_format: str,
+) -> SubtitleCandidateResult:
+    parser_map = {
+        "json3": parse_json3_text,
+        "vtt": parse_vtt_text,
+    }
+    suffix_map = {
+        "json3": ".json3",
+        "vtt": ".vtt",
+    }
+    if sub_format not in parser_map:
+        raise RuntimeError(f"Unsupported structured subtitle format: {sub_format}")
+
+    raw_path = download_raw_subtitle_candidate(
+        url=url,
+        work_dir=work_dir,
+        track=track,
+        proxy=proxy,
+        cookies_from_browser=cookies_from_browser,
+        prefix=prefix,
+        sub_format=sub_format,
+        suffix=suffix_map[sub_format],
+    )
+    raw_text = raw_path.read_text(encoding="utf-8-sig")
+    entries = parser_map[sub_format](raw_text)
+    _, overlap_count, issue_count = normalize_subtitle_timings(entries)
+    subtitle_path = work_dir / f"{prefix}.en.srt"
+    write_srt(subtitle_path, entries)
+    print(
+        f"[subtitle] {sub_format} produced {subtitle_path.name} "
+        f"with {issue_count} timing issues ({overlap_count} overlaps)",
+        file=sys.stderr,
+    )
+    return SubtitleCandidateResult(
+        format_name=sub_format,
+        path=subtitle_path,
+        issue_count=issue_count,
+        overlap_count=overlap_count,
+    )
+
+
+def download_english_subtitle(
+    url: str,
+    work_dir: Path,
+    track: SubtitleTrack,
+    proxy: str | None,
+    cookies_from_browser: str | None,
+) -> Path:
+    successful_results: list[SubtitleCandidateResult] = []
+    try:
+        srt_result = download_subtitle_candidate(
+            url=url,
+            work_dir=work_dir,
+            track=track,
+            proxy=proxy,
+            cookies_from_browser=cookies_from_browser,
+            prefix="subtitle_srtbest",
+            sub_format="srt/best",
+        )
+        successful_results.append(srt_result)
+    except Exception as exc:
+        print(f"[subtitle] srt/best download failed: {exc}", file=sys.stderr)
+        srt_result = None
+
+    if srt_result and srt_result.issue_count == 0:
+        print("[subtitle] selected clean subtitle candidate from srt/best", file=sys.stderr)
+    else:
+        for prefix, sub_format in [("subtitle_json3", "json3"), ("subtitle_vtt", "vtt")]:
+            try:
+                result = download_structured_subtitle_candidate(
+                    url=url,
+                    work_dir=work_dir,
+                    track=track,
+                    proxy=proxy,
+                    cookies_from_browser=cookies_from_browser,
+                    prefix=prefix,
+                    sub_format=sub_format,
+                )
+            except Exception as exc:
+                print(f"[subtitle] {sub_format} download failed: {exc}", file=sys.stderr)
+                continue
+            successful_results.append(result)
+            if result.issue_count == 0:
+                print(
+                    f"[subtitle] selected clean subtitle candidate from {sub_format}",
+                    file=sys.stderr,
+                )
+                break
+
+    if not successful_results:
+        raise RuntimeError("Failed to download any usable English subtitle candidate")
+
+    selected_result = min(
+        successful_results,
+        key=lambda item: (item.issue_count, item.overlap_count, item.format_name != "srt/best"),
+    )
+    final_subtitle_path = work_dir / "source.en.srt"
+    if selected_result.path.resolve() != final_subtitle_path.resolve():
+        shutil.copy2(selected_result.path, final_subtitle_path)
+    if selected_result.issue_count > 0:
+        print(
+            f"[subtitle] no clean candidate found; using {selected_result.format_name} "
+            f"and repairing {selected_result.issue_count} timing issues locally",
+            file=sys.stderr,
+        )
+    return final_subtitle_path
+
+
+def download_assets(
+    url: str,
+    work_dir: Path,
+    track: SubtitleTrack,
+    proxy: str | None,
+    cookies_from_browser: str | None,
+) -> tuple[Path, Path]:
+    video_path = download_video(url, work_dir, proxy, cookies_from_browser)
+    subtitle_path = download_english_subtitle(url, work_dir, track, proxy, cookies_from_browser)
+    return video_path, subtitle_path
 
 
 def find_video_path(work_dir: Path) -> Path:
@@ -370,7 +714,16 @@ def find_video_path(work_dir: Path) -> Path:
     ]
     if not candidates:
         raise RuntimeError("Downloaded video file not found in work directory")
-    return max(candidates, key=lambda item: item.stat().st_size)
+
+    def score(path: Path) -> tuple[int, int]:
+        name = path.name.lower()
+        if name.startswith("source."):
+            return (0, -path.stat().st_size)
+        if "hardsub" in name:
+            return (2, -path.stat().st_size)
+        return (1, -path.stat().st_size)
+
+    return min(candidates, key=score)
 
 
 def find_english_subtitle_path(work_dir: Path, preferred_language: str | None = None) -> Path:
@@ -424,6 +777,83 @@ def parse_srt(path: Path) -> list[SubtitleEntry]:
     return parse_srt_text(path.read_text(encoding="utf-8-sig"))
 
 
+def parse_vtt_text(raw: str) -> list[SubtitleEntry]:
+    chunks = re.split(r"\r?\n\r?\n+", raw.strip())
+    entries: list[SubtitleEntry] = []
+    for chunk in chunks:
+        lines = [line.rstrip("\r") for line in chunk.splitlines()]
+        if not lines:
+            continue
+        if lines[0].strip().startswith("WEBVTT"):
+            continue
+        if lines[0].strip().startswith(("NOTE", "STYLE", "REGION")):
+            continue
+
+        timing_index = None
+        for index, line in enumerate(lines[:2]):
+            if "-->" in line:
+                timing_index = index
+                break
+        if timing_index is None:
+            continue
+
+        timing_line = lines[timing_index].strip()
+        match = VTT_TIMING_PATTERN.search(timing_line)
+        if not match:
+            continue
+
+        start_ms = parse_vtt_timestamp(match.group("start"))
+        end_ms = parse_vtt_timestamp(match.group("end"))
+        text = "\n".join(line.rstrip() for line in lines[timing_index + 1 :] if line.strip()).strip()
+        if not text:
+            continue
+        entries.append(
+            SubtitleEntry(
+                index=len(entries) + 1,
+                timing=format_timing_range(start_ms, end_ms),
+                text=text,
+            )
+        )
+
+    if not entries:
+        raise RuntimeError("Failed to parse WebVTT subtitle entries")
+    return entries
+
+
+def parse_json3_text(raw: str) -> list[SubtitleEntry]:
+    data = json.loads(raw)
+    events = data.get("events")
+    if not isinstance(events, list):
+        raise RuntimeError("json3 subtitle payload did not contain an events list")
+
+    entries: list[SubtitleEntry] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        segs = event.get("segs")
+        if not isinstance(segs, list):
+            continue
+        text = "".join(str(seg.get("utf8", "")) for seg in segs if isinstance(seg, dict))
+        text = html.unescape(text).replace("\xa0", " ").strip()
+        if not text:
+            continue
+
+        start_ms = int(event.get("tStartMs", 0))
+        duration_ms = int(event.get("dDurationMs", 0))
+        end_ms = start_ms + max(duration_ms, 0)
+        entries.append(
+            SubtitleEntry(
+                index=len(entries) + 1,
+                timing=format_timing_range(start_ms, end_ms),
+                text=text,
+            )
+        )
+
+    if not entries:
+        raise RuntimeError("Failed to parse json3 subtitle entries")
+    return entries
+
+
 def write_srt(path: Path, entries: Iterable[SubtitleEntry]) -> None:
     parts: list[str] = []
     for index, entry in enumerate(entries, start=1):
@@ -432,6 +862,116 @@ def write_srt(path: Path, entries: Iterable[SubtitleEntry]) -> None:
         parts.append(entry.text.strip())
         parts.append("")
     path.write_text("\n".join(parts).rstrip() + "\n", encoding="utf-8")
+
+
+def normalize_subtitle_timings(
+    entries: list[SubtitleEntry],
+) -> tuple[list[SubtitleEntry], int, int]:
+    normalized: list[SubtitleEntry] = []
+    overlap_count = 0
+    changed_count = 0
+
+    parsed_ranges: list[tuple[int, int]] = []
+    for entry in entries:
+        start_ms, end_ms = parse_timing_range(entry.timing)
+        if end_ms < start_ms:
+            end_ms = start_ms
+        parsed_ranges.append((start_ms, end_ms))
+
+    adjusted_ranges = list(parsed_ranges)
+    for index in range(len(adjusted_ranges) - 1):
+        current_start, current_end = adjusted_ranges[index]
+        next_start, next_end = adjusted_ranges[index + 1]
+        if next_start < current_start:
+            next_start = current_start
+            if next_end < next_start:
+                next_end = next_start
+            adjusted_ranges[index + 1] = (next_start, next_end)
+        if current_end > next_start:
+            overlap_count += 1
+            current_end = next_start
+            if current_end < current_start:
+                current_end = current_start
+            adjusted_ranges[index] = (current_start, current_end)
+
+    for entry, (start_ms, end_ms), original_range in zip(
+        entries,
+        adjusted_ranges,
+        parsed_ranges,
+        strict=True,
+    ):
+        timing = format_timing_range(start_ms, end_ms)
+        if (start_ms, end_ms) != original_range:
+            changed_count += 1
+        normalized.append(
+            SubtitleEntry(
+                index=entry.index,
+                timing=timing,
+                text=entry.text,
+            )
+        )
+
+    return normalized, overlap_count, changed_count
+
+
+def maybe_rewrite_subtitle_file(
+    path: Path,
+    original_entries: list[SubtitleEntry],
+    updated_entries: list[SubtitleEntry],
+    reason: str,
+) -> None:
+    if len(original_entries) != len(updated_entries):
+        raise RuntimeError(
+            f"Subtitle rewrite mismatch for {path.name}: "
+            f"expected {len(original_entries)} entries, got {len(updated_entries)}"
+        )
+    changed_count = sum(
+        1
+        for original, updated in zip(original_entries, updated_entries, strict=True)
+        if original.index != updated.index
+        or original.timing != updated.timing
+        or original.text != updated.text
+    )
+    if not changed_count:
+        return
+    backup_path = backup_file_once(path)
+    write_srt(path, updated_entries)
+    print(
+        f"[subtitle] {reason}: updated {changed_count} blocks in {path.name} "
+        f"(backup: {backup_path.name})",
+        file=sys.stderr,
+    )
+
+
+def normalize_subtitle_file(path: Path) -> list[SubtitleEntry]:
+    entries = parse_srt(path)
+    normalized_entries, overlap_count, changed_count = normalize_subtitle_timings(entries)
+    if changed_count:
+        maybe_rewrite_subtitle_file(
+            path,
+            entries,
+            normalized_entries,
+            reason=f"repaired {overlap_count} overlapping timing ranges",
+        )
+    return normalized_entries
+
+
+def synchronize_subtitle_timings(
+    entries: list[SubtitleEntry],
+    reference_entries: list[SubtitleEntry],
+) -> list[SubtitleEntry]:
+    if len(entries) != len(reference_entries):
+        raise RuntimeError(
+            f"Subtitle timing sync failed: expected {len(reference_entries)} entries, got {len(entries)}"
+        )
+    return [
+        SubtitleEntry(
+            index=reference_entry.index,
+            timing=reference_entry.timing,
+            text=entry.text,
+        )
+        for entry, reference_entry in zip(entries, reference_entries, strict=True)
+    ]
 
 
 def chunk_entries(entries: list[SubtitleEntry], chunk_size: int, chunk_chars: int) -> list[list[SubtitleEntry]]:
@@ -700,6 +1240,136 @@ def build_force_style(font_name: str, font_size: int) -> str:
     )
 
 
+def quote_ffmpeg_filter_value(value: str) -> str:
+    escaped = value.replace("\\", r"\\").replace("'", r"\'")
+    return f"'{escaped}'"
+
+
+def probe_bitrate(path: Path, select_streams: str | None, entry: str) -> int | None:
+    cmd = ["ffprobe", "-v", "error"]
+    if select_streams:
+        cmd.extend(["-select_streams", select_streams])
+    cmd.extend(
+        [
+            "-show_entries",
+            entry,
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path.name,
+        ]
+    )
+    result = run(cmd, cwd=path.parent, capture_output=True)
+    value = result.stdout.strip()
+    if not value or value == "N/A":
+        return None
+    try:
+        bitrate = int(value)
+    except ValueError:
+        return None
+    return bitrate if bitrate > 0 else None
+
+
+def probe_source_bitrates(video_path: Path) -> tuple[int | None, int | None]:
+    video_bitrate = probe_bitrate(video_path, "v:0", "stream=bit_rate")
+    audio_bitrate = probe_bitrate(video_path, "a:0", "stream=bit_rate")
+    format_bitrate = probe_bitrate(video_path, None, "format=bit_rate")
+
+    if video_bitrate is None and format_bitrate and audio_bitrate:
+        video_bitrate = max(format_bitrate - audio_bitrate, 1)
+    if audio_bitrate is None and format_bitrate and video_bitrate and format_bitrate > video_bitrate:
+        audio_bitrate = max(format_bitrate - video_bitrate, 1)
+    return video_bitrate, audio_bitrate
+
+
+def build_vbr_rate_args(target_bitrate: int) -> list[str]:
+    maxrate = max(int(target_bitrate * 1.10), target_bitrate + 64_000)
+    bufsize = max(target_bitrate * 2, 512_000)
+    return [
+        "-b:v",
+        str(target_bitrate),
+        "-maxrate",
+        str(maxrate),
+        "-bufsize",
+        str(bufsize),
+    ]
+
+
+@lru_cache(maxsize=None)
+def encoder_available(encoder_name: str) -> tuple[bool, str]:
+    test_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=d=1:s=1280x720:r=30",
+        "-an",
+        "-c:v",
+        encoder_name,
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(
+        test_cmd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    details = (result.stderr or result.stdout or "").strip()
+    return result.returncode == 0, details
+
+
+def resolve_video_encoder(requested: str) -> EncoderPlan:
+    nvidia_candidates = [
+        EncoderPlan("nvidia", "hevc", "hevc_nvenc", "NVIDIA NVENC H.265/HEVC"),
+        EncoderPlan("nvidia", "av1", "av1_nvenc", "NVIDIA NVENC AV1"),
+        EncoderPlan("nvidia", "h264", "h264_nvenc", "NVIDIA NVENC H.264"),
+    ]
+    cpu_candidates = [
+        EncoderPlan("cpu", "hevc", "libx265", "CPU/libx265 H.265/HEVC"),
+        EncoderPlan("cpu", "av1", "libsvtav1", "CPU/libsvtav1 AV1"),
+        EncoderPlan("cpu", "h264", "libx264", "CPU/libx264 H.264"),
+    ]
+
+    if requested == "nvidia":
+        candidates = nvidia_candidates
+    elif requested == "cpu":
+        candidates = cpu_candidates
+    else:
+        candidates = nvidia_candidates + cpu_candidates
+
+    failures: list[str] = []
+    for plan in candidates:
+        available, details = encoder_available(plan.encoder)
+        if available:
+            print(
+                f"[encode] using {plan.label} (codec priority: H.265 -> AV1 -> H.264)",
+                file=sys.stderr,
+            )
+            return plan
+        if details:
+            failures.append(f"{plan.encoder}: {details}")
+
+    if requested == "nvidia":
+        raise RuntimeError(
+            "Requested NVIDIA encoders, but none of hevc_nvenc, av1_nvenc, or h264_nvenc "
+            f"could initialize: {' | '.join(failures) or 'unknown error'}"
+        )
+    if requested == "cpu":
+        raise RuntimeError(
+            "Requested CPU encoders, but none of libx265, libsvtav1, or libx264 "
+            f"could initialize: {' | '.join(failures) or 'unknown error'}"
+        )
+    raise RuntimeError(
+        "No usable video encoder found in priority order "
+        "H.265 -> AV1 -> H.264: "
+        f"{' | '.join(failures) or 'unknown error'}"
+    )
+
+
 def burn_subtitles(
     work_dir: Path,
     video_path: Path,
@@ -709,30 +1379,89 @@ def burn_subtitles(
     font_size: int,
     crf: int,
     preset: str,
+    video_encoder: str,
 ) -> None:
     force_style = build_force_style(font_name, font_size)
-    run(
+    subtitle_filter = (
+        f"subtitles={quote_ffmpeg_filter_value(subtitle_path.name)}:"
+        f"force_style={quote_ffmpeg_filter_value(force_style)}"
+    )
+    selected_encoder = resolve_video_encoder(video_encoder)
+    source_video_bitrate, source_audio_bitrate = probe_source_bitrates(video_path)
+
+    if source_video_bitrate:
+        print(
+            f"[encode] target video bitrate {source_video_bitrate} bps (matched from source)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[encode] source video bitrate unavailable; falling back to quality target {crf}",
+            file=sys.stderr,
+        )
+    if source_audio_bitrate:
+        print(
+            f"[encode] target audio bitrate {source_audio_bitrate} bps (matched from source)",
+            file=sys.stderr,
+        )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path.name,
+        "-vf",
+        subtitle_filter,
+    ]
+    cmd.extend(
         [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video_path.name,
-            "-vf",
-            f"subtitles={subtitle_path.name}:force_style={force_style}",
             "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
+            selected_encoder.encoder,
+        ]
+    )
+    if selected_encoder.family == "nvidia":
+        cmd.extend(["-preset", "p5"])
+        if source_video_bitrate:
+            cmd.extend(["-rc", "vbr"])
+            cmd.extend(build_vbr_rate_args(source_video_bitrate))
+        else:
+            cmd.extend(
+                [
+                    "-cq",
+                    str(crf),
+                    "-b:v",
+                    "0",
+                ]
+            )
+    else:
+        if selected_encoder.encoder == "libsvtav1":
+            cmd.extend(["-preset", "6"])
+        else:
+            cmd.extend(["-preset", preset])
+        if source_video_bitrate:
+            cmd.extend(build_vbr_rate_args(source_video_bitrate))
+        else:
+            cmd.extend(
+                [
+                    "-crf",
+                    str(crf),
+                ]
+            )
+    if selected_encoder.codec == "hevc":
+        cmd.extend(["-tag:v", "hvc1"])
+    cmd.extend(
+        [
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            str(source_audio_bitrate or 128_000),
             "-movflags",
             "+faststart",
             output_path.name,
-        ],
+        ]
+    )
+    run(
+        cmd,
         cwd=work_dir,
     )
 
@@ -741,6 +1470,7 @@ def main() -> int:
     args = parse_args()
     ensure_binary("yt-dlp")
     ensure_binary("ffmpeg")
+    ensure_binary("ffprobe")
 
     explicit_work_dir = resolve_path(args.work_dir) if args.work_dir else None
     output_dir = resolve_path(args.output_dir)
@@ -771,12 +1501,20 @@ def main() -> int:
     english_srt = find_english_subtitle_path(work_dir)
     chinese_srt = work_dir / "source.zh.srt"
     output_path = work_dir / "output.zh.hardsub.mp4"
+    english_entries = normalize_subtitle_file(english_srt)
 
     if args.skip_translate:
         if not chinese_srt.exists():
             raise RuntimeError(f"Expected translated subtitle file not found: {chinese_srt}")
+        chinese_entries = parse_srt(chinese_srt)
+        synced_chinese_entries = synchronize_subtitle_timings(chinese_entries, english_entries)
+        maybe_rewrite_subtitle_file(
+            chinese_srt,
+            chinese_entries,
+            synced_chinese_entries,
+            reason="synced translated subtitle timings to repaired English timings",
+        )
     else:
-        english_entries = parse_srt(english_srt)
         chinese_entries = translate_subtitles(
             english_entries,
             api_key=args.api_key,
@@ -799,6 +1537,7 @@ def main() -> int:
         font_size=args.font_size,
         crf=args.crf,
         preset=args.preset,
+        video_encoder=args.video_encoder,
     )
 
     print(str(output_path.resolve()))
